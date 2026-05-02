@@ -2,6 +2,7 @@
 GFEM BDF Combination Tool
 Reads a Combination Excel, finds unit case BDF files, and writes a master BDF with INCLUDE statements.
 """
+from __future__ import annotations
 
 import os
 import queue
