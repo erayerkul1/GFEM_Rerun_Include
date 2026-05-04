@@ -386,6 +386,30 @@ def _format_load_entry(case_id: int, components: list) -> list[str]:
     return lines
 
 
+def _read_spc_id_from_bdf(path: str) -> int | None:
+    """Return the first SPC/SPC1 set ID found in the BDF file."""
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("$"):
+                continue
+            if "," in stripped:
+                parts = [p.strip() for p in stripped.split(",")]
+                if parts[0].upper() in ("SPC", "SPC1", "SPCD", "SPCADD"):
+                    try:
+                        return int(parts[1])
+                    except (ValueError, IndexError):
+                        pass
+            else:
+                kw = stripped[:8].strip().upper()
+                if kw in ("SPC", "SPC1", "SPCD", "SPCADD"):
+                    try:
+                        return int(stripped[8:16].strip())
+                    except (ValueError, IndexError):
+                        pass
+    return None
+
+
 def write_output_bdf(
     gfem_path: str,
     include_paths: list[str],
@@ -541,16 +565,11 @@ class App(tk.Tk):
             row=spc_row, column=1, sticky="ew", **pad)
         ttk.Button(frame, text="Browse", command=self._browse_spc).grid(
             row=spc_row, column=2, **pad)
+        self._spc_id_label = ttk.Label(
+            frame, text="(opsiyonel)", foreground="#888", font=("Courier", 8))
+        self._spc_id_label.grid(row=spc_row, column=3, sticky="w", padx=4)
 
-        ttk.Label(frame, text="SPC ID:").grid(row=spc_row + 1, column=0, sticky="e", **pad)
-        self.spc_id_var = tk.StringVar()
-        ttk.Entry(frame, textvariable=self.spc_id_var, width=12).grid(
-            row=spc_row + 1, column=1, sticky="w", **pad)
-        ttk.Label(frame, text="(boş bırakılırsa SUBCASE'e SPC eklenmez)",
-                  foreground="#888", font=("", 7)).grid(
-            row=spc_row + 1, column=1, sticky="w", padx=(100, 0))
-
-        _SPC_ROWS = 2
+        _SPC_ROWS = 1
 
         # --- Solver selection ---
         _R = len(fields) + _SPC_ROWS
@@ -679,6 +698,13 @@ class App(tk.Tk):
         )
         if p:
             self.spc_var.set(p)
+            spc_id = _read_spc_id_from_bdf(p)
+            if spc_id is not None:
+                self._spc_id_label.configure(
+                    text=f"→ SPC ID: {spc_id}", foreground="#005580")
+            else:
+                self._spc_id_label.configure(
+                    text="⚠ SPC ID bulunamadı", foreground="#cc0000")
 
     # --- Generate ---
 
@@ -690,7 +716,6 @@ class App(tk.Tk):
         output   = self.output_var.get().strip()
         solver   = self.solver_var.get()
         spc_bdf  = self.spc_var.get().strip()
-        spc_id_s = self.spc_id_var.get().strip()
 
         errors = []
         if not gfem or not os.path.isfile(gfem):
@@ -705,12 +730,13 @@ class App(tk.Tk):
             errors.append("Please specify an output BDF path.")
         if spc_bdf and not os.path.isfile(spc_bdf):
             errors.append("SPC BDF file not found.")
+
+        # Auto-read SPC ID from file
         spc_id = 0
-        if spc_id_s:
-            try:
-                spc_id = int(spc_id_s)
-            except ValueError:
-                errors.append("SPC ID must be an integer.")
+        if spc_bdf and os.path.isfile(spc_bdf):
+            spc_id = _read_spc_id_from_bdf(spc_bdf) or 0
+            if not spc_id:
+                errors.append("SPC BDF file selected but no SPC/SPC1 card found inside.")
         if errors:
             messagebox.showerror("Input Error", "\n".join(errors))
             return
