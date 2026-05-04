@@ -1,6 +1,7 @@
 """
 GFEM BDF Combination Tool
-Reads a Combination Excel, finds unit case BDF files, and writes a master BDF with INCLUDE statements.
+Reads a Combination Excel, finds unit case BDF files via a List Subcases mapping Excel,
+and writes a master BDF with INCLUDE statements (deduplicated).
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ except ImportError:
 def read_case_ids_from_excel(excel_path: str, log_fn=None) -> set[int]:
     """Return unique non-zero integer case IDs from all *CASE ID columns excluding THERMAL."""
     if log_fn:
-        log_fn("[EXCEL] Reading Excel file (this may take a moment)...")
+        log_fn("[EXCEL] Reading Combination Excel...")
     df = pd.read_excel(excel_path, engine="openpyxl")
 
     case_id_cols = [
@@ -37,7 +38,7 @@ def read_case_ids_from_excel(excel_path: str, log_fn=None) -> set[int]:
         if "CASE ID" in str(col).upper() and "THERMAL" not in str(col).upper()
     ]
     if log_fn:
-        log_fn(f"[EXCEL] Columns found ({len(case_id_cols)}): {', '.join(str(c) for c in case_id_cols)}")
+        log_fn(f"[EXCEL] Unit case columns ({len(case_id_cols)}): {', '.join(str(c) for c in case_id_cols)}")
 
     ids: set[int] = set()
     for col in case_id_cols:
@@ -51,74 +52,94 @@ def read_case_ids_from_excel(excel_path: str, log_fn=None) -> set[int]:
     return ids
 
 
-def find_bdf_files_for_ids(
-    search_dir: str,
-    case_ids: set[int],
-    log_fn=None,
-    status_fn=None,
-) -> dict[int, list[Path]]:
-    """Recursively find BDF files whose names contain each case ID."""
-    result: dict[int, list[Path]] = {cid: [] for cid in case_ids}
-    str_ids = {cid: str(cid) for cid in case_ids}
+def read_subcase_mapping(list_excel_path: str, log_fn=None) -> dict[int, str]:
+    """
+    Read the List Subcases Excel.
+    Expects column A = FILE (relative path), column B = SUBCASE_ID.
+    Returns {subcase_id: relative_file_path}.
+    """
+    if log_fn:
+        log_fn("[SUBCASES] Reading List Subcases Excel...")
+    df = pd.read_excel(list_excel_path, engine="openpyxl")
 
-    total_scanned = 0
-    total_matched = 0
-    dir_count = 0
+    # Normalise column names — use positional fallback if headers differ
+    cols = list(df.columns)
+    file_col = cols[0]
+    id_col = cols[1]
+    if log_fn:
+        log_fn(f"[SUBCASES] Using columns: FILE='{file_col}', SUBCASE_ID='{id_col}'")
 
-    for root, _dirs, files in os.walk(search_dir):
-        dir_count += 1
-        short_root = root if len(root) <= 80 else "..." + root[-77:]
-        if status_fn:
-            status_fn(f"[{dir_count} dirs]  {short_root}")
-        if log_fn:
-            log_fn(f"[SCAN] ({dir_count}) {root}")
-
-        for fname in files:
-            if not fname.lower().endswith(".bdf"):
-                continue
-            total_scanned += 1
-            for cid, sid in str_ids.items():
-                if sid in fname:
-                    result[cid].append(Path(root) / fname)
-                    total_matched += 1
+    mapping: dict[int, str] = {}
+    for _, row in df.iterrows():
+        try:
+            sid = int(row[id_col])
+            fpath = str(row[file_col]).strip()
+            mapping[sid] = fpath
+        except (ValueError, TypeError):
+            pass
 
     if log_fn:
-        log_fn(
-            f"[SCAN] Done. {dir_count} dirs | {total_scanned} BDF files scanned | {total_matched} matches."
-        )
-    if status_fn:
-        status_fn("Scan complete.")
-    return result
+        log_fn(f"[SUBCASES] {len(mapping)} subcase → file mappings loaded.")
+    return mapping
+
+
+def resolve_include_paths(
+    case_ids: set[int],
+    subcase_mapping: dict[int, str],
+    base_dir: str,
+    log_fn=None,
+) -> tuple[list[str], list[int]]:
+    """
+    For each case ID, look up the relative path and resolve against base_dir.
+    Returns (ordered_unique_paths, missing_ids).
+    Preserves first-seen order; duplicates are dropped.
+    """
+    seen: set[str] = set()
+    ordered_paths: list[str] = []
+    missing_ids: list[int] = []
+
+    for cid in sorted(case_ids):
+        if cid not in subcase_mapping:
+            missing_ids.append(cid)
+            if log_fn:
+                log_fn(f"[ERROR] Case ID {cid} not found in List Subcases Excel.")
+            continue
+
+        rel = subcase_mapping[cid].lstrip("\\/")
+        full_path = os.path.join(base_dir, rel)
+        norm = os.path.normpath(full_path)
+
+        if norm not in seen:
+            seen.add(norm)
+            ordered_paths.append(norm)
+            if log_fn:
+                log_fn(f"[OK]    {cid} → {norm}")
+        else:
+            if log_fn:
+                log_fn(f"[DUP]   {cid} → already included ({os.path.basename(norm)}), skipped.")
+
+    return ordered_paths, missing_ids
 
 
 def write_output_bdf(
     gfem_path: str,
-    files_by_id: dict[int, list[Path]],
+    include_paths: list[str],
     output_path: str,
     log_fn=None,
 ) -> int:
     """Write the master BDF with INCLUDE statements. Returns total INCLUDE count."""
-    include_count = 0
     lines = []
-
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines.append("$ Generated by GFEM BDF Combination Tool")
     lines.append(f"$ Date: {timestamp}")
     lines.append("$")
     lines.append("$ GFEM Model")
     lines.append(f"INCLUDE '{gfem_path}'")
-    include_count += 1
     lines.append("$")
     lines.append("$ Unit Case Loads")
 
-    for cid in sorted(files_by_id):
-        paths = sorted(files_by_id[cid])
-        if not paths:
-            continue
-        lines.append(f"$ --- Case ID: {cid} ---")
-        for p in paths:
-            lines.append(f"INCLUDE '{p}'")
-            include_count += 1
+    for p in include_paths:
+        lines.append(f"INCLUDE '{p}'")
 
     lines.append("$")
     lines.append("$ END")
@@ -126,8 +147,9 @@ def write_output_bdf(
     with open(output_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
+    include_count = 1 + len(include_paths)  # 1 for GFEM
     if log_fn:
-        log_fn(f"[WRITE] Output written: {output_path}  ({include_count} INCLUDE lines total)")
+        log_fn(f"[WRITE] {output_path}  ({include_count} INCLUDE lines total)")
     return include_count
 
 
@@ -153,12 +175,12 @@ class App(tk.Tk):
         self.rowconfigure(0, weight=1)
         frame.columnconfigure(1, weight=1)
 
-        # --- Input rows ---
         fields = [
-            ("GFEM BDF File:",     "gfem_var",   self._browse_gfem),
-            ("Combination Excel:", "excel_var",  self._browse_excel),
-            ("Unit Case Dir:",     "dir_var",    self._browse_dir),
-            ("Output BDF:",        "output_var", self._browse_output),
+            ("GFEM BDF File:",        "gfem_var",    self._browse_gfem),
+            ("Combination Excel:",    "excel_var",   self._browse_excel),
+            ("List Subcases Excel:",  "subcases_var", self._browse_subcases),
+            ("Unit Case Base Dir:",   "dir_var",     self._browse_dir),
+            ("Output BDF:",           "output_var",  self._browse_output),
         ]
         for row, (label, attr, cmd) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", **pad)
@@ -168,31 +190,26 @@ class App(tk.Tk):
             entry.grid(row=row, column=1, sticky="ew", **pad)
             ttk.Button(frame, text="Browse", command=cmd).grid(row=row, column=2, **pad)
 
-        # --- Generate button ---
-        self._gen_btn = ttk.Button(
-            frame, text="Generate BDF", command=self._on_generate
-        )
-        self._gen_btn.grid(row=4, column=0, columnspan=3, pady=10)
+        self._gen_btn = ttk.Button(frame, text="Generate BDF", command=self._on_generate)
+        self._gen_btn.grid(row=len(fields), column=0, columnspan=3, pady=10)
 
-        # --- Progress bar ---
         self._progress = ttk.Progressbar(frame, mode="indeterminate")
-        self._progress.grid(row=5, column=0, columnspan=3, sticky="ew", padx=8)
+        self._progress.grid(row=len(fields) + 1, column=0, columnspan=3, sticky="ew", padx=8)
 
-        # --- Live status label ---
         self._status_var = tk.StringVar(value="Ready.")
-        status_label = ttk.Label(
+        ttk.Label(
             frame, textvariable=self._status_var,
             foreground="#005580", font=("Courier", 8), anchor="w"
-        )
-        status_label.grid(row=6, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
+        ).grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
 
-        # --- Log area ---
-        ttk.Label(frame, text="Log:").grid(row=7, column=0, sticky="w", padx=8)
+        ttk.Label(frame, text="Log:").grid(row=len(fields) + 3, column=0, sticky="w", padx=8)
         self._log_widget = scrolledtext.ScrolledText(
             frame, height=18, state="disabled", wrap="word", font=("Courier", 8)
         )
-        self._log_widget.grid(row=8, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
-        frame.rowconfigure(8, weight=1)
+        self._log_widget.grid(
+            row=len(fields) + 4, column=0, columnspan=3, sticky="nsew", padx=8, pady=4
+        )
+        frame.rowconfigure(len(fields) + 4, weight=1)
 
     # --- Browse helpers ---
 
@@ -212,8 +229,16 @@ class App(tk.Tk):
         if p:
             self.excel_var.set(p)
 
+    def _browse_subcases(self):
+        p = filedialog.askopenfilename(
+            title="Select List Subcases Excel",
+            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")],
+        )
+        if p:
+            self.subcases_var.set(p)
+
     def _browse_dir(self):
-        p = filedialog.askdirectory(title="Select Unit Case BDF Search Directory")
+        p = filedialog.askdirectory(title="Select Unit Case Base Directory")
         if p:
             self.dir_var.set(p)
 
@@ -229,18 +254,21 @@ class App(tk.Tk):
     # --- Generate ---
 
     def _on_generate(self):
-        gfem = self.gfem_var.get().strip()
-        excel = self.excel_var.get().strip()
-        search_dir = self.dir_var.get().strip()
-        output = self.output_var.get().strip()
+        gfem      = self.gfem_var.get().strip()
+        excel     = self.excel_var.get().strip()
+        subcases  = self.subcases_var.get().strip()
+        base_dir  = self.dir_var.get().strip()
+        output    = self.output_var.get().strip()
 
         errors = []
         if not gfem or not os.path.isfile(gfem):
             errors.append("GFEM BDF file not found.")
         if not excel or not os.path.isfile(excel):
             errors.append("Combination Excel file not found.")
-        if not search_dir or not os.path.isdir(search_dir):
-            errors.append("Unit case search directory not found.")
+        if not subcases or not os.path.isfile(subcases):
+            errors.append("List Subcases Excel file not found.")
+        if not base_dir or not os.path.isdir(base_dir):
+            errors.append("Unit case base directory not found.")
         if not output:
             errors.append("Please specify an output BDF path.")
         if errors:
@@ -250,43 +278,38 @@ class App(tk.Tk):
         self._gen_btn.configure(state="disabled")
         self._progress.start(10)
 
-        thread = threading.Thread(
+        threading.Thread(
             target=self._run_generation,
-            args=(gfem, excel, search_dir, output),
+            args=(gfem, excel, subcases, base_dir, output),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
-    def _run_generation(self, gfem, excel, search_dir, output):
+    def _run_generation(self, gfem, excel, subcases, base_dir, output):
         try:
-            self._status("Reading Excel...")
+            self._status("Reading Combination Excel...")
             case_ids = read_case_ids_from_excel(excel, log_fn=self._log)
-            self._log(f"[INFO] {len(case_ids)} unique case IDs found (thermal excluded).")
-            self._status(f"{len(case_ids)} case IDs found. Starting directory scan...")
+            self._log(f"[INFO] {len(case_ids)} unique case IDs (thermal excluded).")
 
-            files_by_id = find_bdf_files_for_ids(
-                search_dir, case_ids, log_fn=self._log, status_fn=self._status
-            )
+            self._status("Reading List Subcases Excel...")
+            subcase_mapping = read_subcase_mapping(subcases, log_fn=self._log)
 
-            found_count = sum(1 for v in files_by_id.values() if v)
-            not_found_ids = sorted(cid for cid, v in files_by_id.items() if not v)
-
+            self._status("Resolving file paths...")
             self._log("-" * 60)
-            for cid in sorted(files_by_id):
-                paths = files_by_id[cid]
-                if paths:
-                    self._log(f"[OK]   {cid} → {len(paths)} file(s)")
-                else:
-                    self._log(f"[WARN] {cid} → no files found")
+            include_paths, missing = resolve_include_paths(
+                case_ids, subcase_mapping, base_dir, log_fn=self._log
+            )
             self._log("-" * 60)
 
             self._log(
-                f"[INFO] {found_count}/{len(case_ids)} IDs matched. "
-                f"{len(not_found_ids)} IDs had no match."
+                f"[INFO] {len(include_paths)} unique files to include. "
+                f"{len(missing)} IDs not found in subcases list."
             )
+
+            if missing:
+                self._log(f"[ERROR] Missing IDs: {sorted(missing)}")
+
             self._status("Writing output BDF...")
-            self._log("[INFO] Writing output BDF...")
-            write_output_bdf(gfem, files_by_id, output, log_fn=self._log)
+            write_output_bdf(gfem, include_paths, output, log_fn=self._log)
             self._log("[DONE] Generation complete.")
             self._status("Done.")
 
