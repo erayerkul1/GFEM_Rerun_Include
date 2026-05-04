@@ -26,6 +26,38 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Configuration: output requests and PARAM cards
+# ---------------------------------------------------------------------------
+
+# Each tuple: (card_text, short_name, description, default_checked)
+OUTPUT_REQUEST_OPTIONS: list[tuple[str, str, str, bool]] = [
+    ("DISPLACEMENT(SORT1,PLOT,REAL)=ALL",  "DISPLACEMENT", "Düğüm noktası yer değiştirmeleri",    True),
+    ("FORCE(SORT1,PLOT,REAL,CENTER)=ALL",  "FORCE",        "Eleman kuvvetleri (merkez)",           True),
+    ("GPFORCE(PLOT)=ALL",                   "GPFORCE",      "Grid noktası kuvvet dengesi",          True),
+    ("OLOAD(PLOT)=ALL",                     "OLOAD",        "Uygulanan dış yükler",                 True),
+    ("SPCFORCE(SORT1,PLOT)=ALL",            "SPCFORCE",     "SPC reaksiyon kuvvetleri",             True),
+    ("STRESS(SORT1,PLOT,REAL)=ALL",         "STRESS",       "Eleman gerilmeleri",                   False),
+    ("STRAIN(SORT1,PLOT,REAL)=ALL",         "STRAIN",       "Eleman şekil değiştirmeleri",          False),
+    ("MPCFORCE(SORT1,PLOT)=ALL",            "MPCFORCE",     "MPC reaksiyon kuvvetleri",             False),
+]
+
+# Each tuple: (keyword, name, value, description, default_checked)
+PARAM_OPTIONS: list[tuple[str, str, str, str, bool]] = [
+    ("PARAM",  "AUTOSPC",   "NO",   "Singüler DOF'ları otomatik sabitleme",          True),
+    ("PARAM",  "POST",      "-1",   "OP2 formatında post-processing çıktısı",        True),
+    ("PARAM",  "K6ROT",     "1.",   "Kabuk elemanları sondaj rijitliği çarpanı",     True),
+    ("PARAM",  "OUNIT2",    "12",   "İkincil çıktı birimi (inç→mm için 12)",         True),
+    ("PARAM",  "OMID",      "YES",  "Eleman çıktılarını orta noktadan al",           True),
+    ("PARAM",  "PRTMAXIM",  "YES",  "Maksimum değer özetini yazdır",                 True),
+    ("PARAM",  "BAILOUT",   "0",    "İlk kritik hatada analizi durdur (0=dur)",      True),
+    ("PARAM",  "OGEOM",     "YES",  "Geometri verisini çıktı dosyasına yaz",         True),
+    ("PARAM",  "PRGPST",    "YES",  "Grid noktası gerilmelerini yazdır",             True),
+    ("PARAM",  "POSTEXT",   "YES",  "Genişletilmiş çıktı – NX Nastran'a özgü",      False),
+    ("MDLPRM", "HDF5",      "1",    "HDF5 formatında ikincil çıktı dosyası oluştur", False),
+]
+
+
+# ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
@@ -300,6 +332,8 @@ def write_output_bdf(
     combinations: list[LoadCombination],
     solver: str,
     output_path: str,
+    output_requests: list[str],
+    param_cards: list[str],
     log_fn=None,
 ) -> int:
     """Write a complete Nastran solution deck. Returns total INCLUDE count."""
@@ -329,6 +363,13 @@ def write_output_bdf(
         "TITLE = GFEM Combined Load Cases",
         "$",
     ]
+
+    # Global output requests (before first SUBCASE)
+    if output_requests:
+        lines.append("$ Global Output Requests")
+        lines.extend(output_requests)
+        lines.append("$")
+
     for combo in combinations:
         lines += [
             f"SUBCASE {combo.case_id}",
@@ -343,12 +384,11 @@ def write_output_bdf(
         "$",
     ]
 
-    # Solver-specific PARAM
-    if solver == "NX":
-        lines.append("PARAM,POSTEXT,YES")
-    else:
-        lines.append("PARAM,POST,-1")
-    lines.append("$")
+    # User-selected PARAM cards
+    if param_cards:
+        lines.append("$ PARAM Cards")
+        lines.extend(param_cards)
+        lines.append("$")
 
     # GFEM model
     lines += [
@@ -422,33 +462,58 @@ class App(tk.Tk):
 
         # --- Solver selection ---
         solver_frame = ttk.LabelFrame(frame, text="Nastran Solver", padding=6)
-        solver_frame.grid(row=len(fields), column=0, columnspan=3, sticky="w", padx=8, pady=6)
+        solver_frame.grid(row=len(fields), column=0, columnspan=3, sticky="ew", padx=8, pady=4)
         self.solver_var = tk.StringVar(value="NX")
         ttk.Radiobutton(solver_frame, text="NX Nastran",  variable=self.solver_var, value="NX").pack(side="left", padx=12)
         ttk.Radiobutton(solver_frame, text="MSC Nastran", variable=self.solver_var, value="MSC").pack(side="left", padx=12)
 
+        # --- Global Output Requests ---
+        out_frame = ttk.LabelFrame(frame, text="Global Output Requests", padding=6)
+        out_frame.grid(row=len(fields) + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.output_req_vars: list[tk.BooleanVar] = []
+        for i, (card, name, desc, default) in enumerate(OUTPUT_REQUEST_OPTIONS):
+            var = tk.BooleanVar(value=default)
+            self.output_req_vars.append(var)
+            row_f = ttk.Frame(out_frame)
+            row_f.grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=(0, 16))
+            ttk.Checkbutton(row_f, text=name, variable=var, width=14).pack(side="left")
+            ttk.Label(row_f, text=desc, foreground="#555", font=("", 7)).pack(side="left")
+
+        # --- PARAM Cards ---
+        param_frame = ttk.LabelFrame(frame, text="PARAM Cards", padding=6)
+        param_frame.grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        self.param_vars: list[tk.BooleanVar] = []
+        for i, (kw, name, val, desc, default) in enumerate(PARAM_OPTIONS):
+            var = tk.BooleanVar(value=default)
+            self.param_vars.append(var)
+            row_f = ttk.Frame(param_frame)
+            row_f.grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=(0, 16))
+            label = f"{kw}  {name}  {val}"
+            ttk.Checkbutton(row_f, text=label, variable=var, width=22).pack(side="left")
+            ttk.Label(row_f, text=desc, foreground="#555", font=("", 7)).pack(side="left")
+
         # --- Generate button ---
         self._gen_btn = ttk.Button(frame, text="Generate BDF", command=self._on_generate)
-        self._gen_btn.grid(row=len(fields) + 1, column=0, columnspan=3, pady=8)
+        self._gen_btn.grid(row=len(fields) + 3, column=0, columnspan=3, pady=8)
 
         # --- Progress bar ---
         self._progress = ttk.Progressbar(frame, mode="indeterminate")
-        self._progress.grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8)
+        self._progress.grid(row=len(fields) + 4, column=0, columnspan=3, sticky="ew", padx=8)
 
         # --- Status label ---
         self._status_var = tk.StringVar(value="Ready.")
         ttk.Label(
             frame, textvariable=self._status_var,
             foreground="#005580", font=("Courier", 8), anchor="w"
-        ).grid(row=len(fields) + 3, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
+        ).grid(row=len(fields) + 5, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
 
         # --- Log ---
-        ttk.Label(frame, text="Log:").grid(row=len(fields) + 4, column=0, sticky="w", padx=8)
+        ttk.Label(frame, text="Log:").grid(row=len(fields) + 6, column=0, sticky="w", padx=8)
         self._log_widget = scrolledtext.ScrolledText(
-            frame, height=16, state="disabled", wrap="word", font=("Courier", 8)
+            frame, height=12, state="disabled", wrap="word", font=("Courier", 8)
         )
-        self._log_widget.grid(row=len(fields) + 5, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
-        frame.rowconfigure(len(fields) + 5, weight=1)
+        self._log_widget.grid(row=len(fields) + 7, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
+        frame.rowconfigure(len(fields) + 7, weight=1)
 
     # --- Browse helpers ---
 
@@ -515,16 +580,28 @@ class App(tk.Tk):
             messagebox.showerror("Input Error", "\n".join(errors))
             return
 
+        sel_outputs = [
+            card
+            for (card, _, _, _), var in zip(OUTPUT_REQUEST_OPTIONS, self.output_req_vars)
+            if var.get()
+        ]
+        sel_params = [
+            f"{kw},{name},{val}"
+            for (kw, name, val, _, _), var in zip(PARAM_OPTIONS, self.param_vars)
+            if var.get()
+        ]
+
         self._gen_btn.configure(state="disabled")
         self._progress.start(10)
 
         threading.Thread(
             target=self._run_generation,
-            args=(gfem, excel, subcases, base_dir, output, solver),
+            args=(gfem, excel, subcases, base_dir, output, solver, sel_outputs, sel_params),
             daemon=True,
         ).start()
 
-    def _run_generation(self, gfem, excel, subcases, base_dir, output, solver):
+    def _run_generation(self, gfem, excel, subcases, base_dir, output, solver,
+                        sel_outputs, sel_params):
         try:
             self._status("Reading Combination Excel...")
             case_ids = read_case_ids_from_excel(excel, log_fn=self._log)
@@ -554,7 +631,12 @@ class App(tk.Tk):
 
             solver_label = "NX Nastran" if solver == "NX" else "MSC Nastran"
             self._status(f"Writing {solver_label} deck...")
-            write_output_bdf(gfem, include_paths, combinations, solver, output, log_fn=self._log)
+            write_output_bdf(
+                gfem, include_paths, combinations, solver, output,
+                output_requests=sel_outputs,
+                param_cards=sel_params,
+                log_fn=self._log,
+            )
             self._log("[DONE] Generation complete.")
             self._status("Done.")
 
