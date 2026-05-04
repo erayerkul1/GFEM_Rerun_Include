@@ -142,6 +142,20 @@ def read_subcase_mapping(list_excel_path: str, log_fn=None) -> dict[int, str]:
     return mapping
 
 
+def _build_file_index(base_dir: str, log_fn=None) -> dict[str, str]:
+    """Walk base_dir recursively and return {lowercase_filename: full_path} for all .bdf files."""
+    index: dict[str, str] = {}
+    count = 0
+    for root, _, files in os.walk(base_dir):
+        for fname in files:
+            if fname.lower().endswith(".bdf"):
+                index[fname.lower()] = os.path.join(root, fname)
+                count += 1
+    if log_fn:
+        log_fn(f"[INDEX] {count} BDF files indexed under {base_dir}")
+    return index
+
+
 def resolve_include_paths(
     case_ids: set[int],
     subcase_mapping: dict[int, str],
@@ -149,9 +163,12 @@ def resolve_include_paths(
     log_fn=None,
 ) -> tuple[list[str], list[int]]:
     """
-    Resolve unit case IDs to absolute file paths, deduplicated (first-seen order).
+    Resolve unit case IDs to absolute file paths by searching base_dir recursively.
+    Only the filename from the List Subcases path is used for matching.
     Returns (ordered_unique_paths, missing_ids).
     """
+    file_index = _build_file_index(base_dir, log_fn=log_fn)
+
     seen: set[str] = set()
     ordered_paths: list[str] = []
     missing_ids: list[int] = []
@@ -163,9 +180,17 @@ def resolve_include_paths(
                 log_fn(f"[ERROR] Case ID {cid} not found in List Subcases Excel.")
             continue
 
-        rel = subcase_mapping[cid].lstrip("\\/")
-        full_path = os.path.normpath(os.path.join(base_dir, rel))
+        # Handle both Windows (\) and Unix (/) path separators
+        filename = subcase_mapping[cid].replace("\\", "/").split("/")[-1]
+        full_path = file_index.get(filename.lower())
 
+        if full_path is None:
+            missing_ids.append(cid)
+            if log_fn:
+                log_fn(f"[ERROR] {cid} → '{filename}' not found under {base_dir}")
+            continue
+
+        full_path = os.path.normpath(full_path)
         if full_path not in seen:
             seen.add(full_path)
             ordered_paths.append(full_path)
@@ -173,7 +198,7 @@ def resolve_include_paths(
                 log_fn(f"[OK]    {cid} → {full_path}")
         else:
             if log_fn:
-                log_fn(f"[DUP]   {cid} → already included ({os.path.basename(full_path)}), skipped.")
+                log_fn(f"[DUP]   {cid} → already included ({filename}), skipped.")
 
     return ordered_paths, missing_ids
 
