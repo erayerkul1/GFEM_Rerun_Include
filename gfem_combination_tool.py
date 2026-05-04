@@ -97,6 +97,19 @@ PARAM_OPTIONS: list[tuple] = [
         ("NO",  "Pasif"),
     ], "YES", False),
 
+    ("PARAM", "INREL", "Inertia relief — serbest-serbest statik analiz", [
+        ("0",  "Kapalı — standart kısıtlı statik analiz (default)"),
+        ("-1", "Otomatik — 6 rijit cisim modunu ortadan kaldırır (serbest GFEM için)"),
+        ("-2", "Kullanıcı tanımlı — SUPORT kartıyla belirtilen mesnet noktaları"),
+    ], "-1", False),
+
+    ("PARAM", "WTMASS", "Ağırlık → kütle dönüşüm katsayısı (1/g)", [
+        ("1.0",      "SI N-m-kg — dönüşüm gerekmez"),
+        ("0.10197",  "N-m — ağırlık N cinsinden, g = 9.807 m/s²"),
+        ("1.02e-4",  "N-mm — ağırlık N cinsinden, g = 9806.65 mm/s²"),
+        ("0.00259",  "lbf-in — ağırlık lbf cinsinden, g = 386.04 in/s²"),
+    ], "1.02e-4", False),
+
     ("MDLPRM", "HDF5", "HDF5 formatında ikincil çıktı", [
         ("0", "Kapalı — HDF5 dosyası oluşturma"),
         ("1", "Açık — .h5 uzantılı HDF5 çıktı dosyası oluştur"),
