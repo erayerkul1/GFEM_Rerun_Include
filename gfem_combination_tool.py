@@ -1,13 +1,14 @@
 """
 GFEM BDF Combination Tool
-Reads a Combination Excel, finds unit case BDF files via a List Subcases mapping Excel,
-and writes a master BDF with INCLUDE statements (deduplicated).
+Reads a Combination Excel, resolves unit case files via a List Subcases mapping,
+and writes a complete Nastran solution deck (SOL 101 + SUBCASEs + LOAD entries).
 """
 from __future__ import annotations
 
 import os
 import queue
 import threading
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 import tkinter as tk
@@ -24,6 +25,16 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LoadCombination:
+    case_id: int
+    components: list = field(default_factory=list)  # [(multiplier, unit_case_id), ...]
+
+
+# ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 
@@ -33,8 +44,9 @@ def read_case_ids_from_excel(excel_path: str, log_fn=None) -> set[int]:
         log_fn("[EXCEL] Reading Combination Excel...")
     df = pd.read_excel(excel_path, engine="openpyxl")
 
+    cols = list(df.columns)
     case_id_cols = [
-        col for col in df.columns
+        col for col in cols
         if "CASE ID" in str(col).upper() and "THERMAL" not in str(col).upper()
     ]
     if log_fn:
@@ -52,22 +64,69 @@ def read_case_ids_from_excel(excel_path: str, log_fn=None) -> set[int]:
     return ids
 
 
+def read_load_combinations(excel_path: str, log_fn=None) -> list[LoadCombination]:
+    """
+    Read each row of the Combination Excel as a LoadCombination.
+    Column A = Combined Load Case ID.
+    Each *CASE ID column (non-thermal) and its immediately following Multiplier column
+    form one component pair.
+    """
+    df = pd.read_excel(excel_path, engine="openpyxl")
+    cols = list(df.columns)
+
+    combined_id_col = cols[0]
+
+    # Build (case_id_col_index, multiplier_col_index) pairs, skip thermal
+    pairs: list[tuple[int, int]] = []
+    for i, col in enumerate(cols):
+        col_upper = str(col).upper()
+        if "CASE ID" in col_upper and "THERMAL" not in col_upper:
+            if i + 1 < len(cols):
+                pairs.append((i, i + 1))
+
+    if log_fn:
+        log_fn(f"[COMBO] {len(pairs)} non-thermal ID/multiplier column pairs found.")
+
+    combinations: list[LoadCombination] = []
+    for _, row in df.iterrows():
+        try:
+            cid = int(row.iloc[0])
+        except (ValueError, TypeError):
+            continue
+
+        components: list[tuple[float, int]] = []
+        for id_idx, mult_idx in pairs:
+            try:
+                unit_id = int(row.iloc[id_idx])
+                mult = float(row.iloc[mult_idx])
+                if unit_id != 0:
+                    components.append((mult, unit_id))
+            except (ValueError, TypeError):
+                pass
+
+        if components:
+            combinations.append(LoadCombination(case_id=cid, components=components))
+
+    if log_fn:
+        log_fn(f"[COMBO] {len(combinations)} combined load cases read.")
+    return combinations
+
+
 def read_subcase_mapping(list_excel_path: str, log_fn=None) -> dict[int, str]:
     """
     Read the List Subcases Excel.
-    Expects column A = FILE (relative path), column B = SUBCASE_ID.
+    Column A = FILE (relative path), Column B = SUBCASE_ID.
     Returns {subcase_id: relative_file_path}.
     """
     if log_fn:
         log_fn("[SUBCASES] Reading List Subcases Excel...")
     df = pd.read_excel(list_excel_path, engine="openpyxl")
 
-    # Normalise column names — use positional fallback if headers differ
     cols = list(df.columns)
     file_col = cols[0]
     id_col = cols[1]
     if log_fn:
-        log_fn(f"[SUBCASES] Using columns: FILE='{file_col}', SUBCASE_ID='{id_col}'")
+        log_fn(f"[SUBCASES] FILE='{file_col}', SUBCASE_ID='{id_col}'")
 
     mapping: dict[int, str] = {}
     for _, row in df.iterrows():
@@ -90,9 +149,8 @@ def resolve_include_paths(
     log_fn=None,
 ) -> tuple[list[str], list[int]]:
     """
-    For each case ID, look up the relative path and resolve against base_dir.
+    Resolve unit case IDs to absolute file paths, deduplicated (first-seen order).
     Returns (ordered_unique_paths, missing_ids).
-    Preserves first-seen order; duplicates are dropped.
     """
     seen: set[str] = set()
     ordered_paths: list[str] = []
@@ -106,50 +164,142 @@ def resolve_include_paths(
             continue
 
         rel = subcase_mapping[cid].lstrip("\\/")
-        full_path = os.path.join(base_dir, rel)
-        norm = os.path.normpath(full_path)
+        full_path = os.path.normpath(os.path.join(base_dir, rel))
 
-        if norm not in seen:
-            seen.add(norm)
-            ordered_paths.append(norm)
+        if full_path not in seen:
+            seen.add(full_path)
+            ordered_paths.append(full_path)
             if log_fn:
-                log_fn(f"[OK]    {cid} → {norm}")
+                log_fn(f"[OK]    {cid} → {full_path}")
         else:
             if log_fn:
-                log_fn(f"[DUP]   {cid} → already included ({os.path.basename(norm)}), skipped.")
+                log_fn(f"[DUP]   {cid} → already included ({os.path.basename(full_path)}), skipped.")
 
     return ordered_paths, missing_ids
+
+
+def _format_load_entry(case_id: int, components: list) -> list[str]:
+    """
+    Format a Nastran LOAD bulk entry with continuation lines.
+    First line:  LOAD, SID, 1.0, S1,L1, S2,L2, S3,L3, [+]
+    Cont. lines: +, S4,L4, S5,L5, S6,L6, S7,L7, [+]
+    """
+    FIRST_LINE_PAIRS = 3
+    CONT_LINE_PAIRS = 4
+
+    lines: list[str] = []
+    remaining = list(components)
+
+    chunk = remaining[:FIRST_LINE_PAIRS]
+    remaining = remaining[FIRST_LINE_PAIRS:]
+
+    parts = ["LOAD", str(case_id), "1.0"]
+    for mult, uid in chunk:
+        parts += [str(mult), str(uid)]
+    if remaining:
+        parts.append("+")
+    lines.append(",".join(parts))
+
+    while remaining:
+        chunk = remaining[:CONT_LINE_PAIRS]
+        remaining = remaining[CONT_LINE_PAIRS:]
+        parts = ["+"]
+        for mult, uid in chunk:
+            parts += [str(mult), str(uid)]
+        if remaining:
+            parts.append("+")
+        lines.append(",".join(parts))
+
+    return lines
 
 
 def write_output_bdf(
     gfem_path: str,
     include_paths: list[str],
+    combinations: list[LoadCombination],
+    solver: str,
     output_path: str,
     log_fn=None,
 ) -> int:
-    """Write the master BDF with INCLUDE statements. Returns total INCLUDE count."""
-    lines = []
+    """Write a complete Nastran solution deck. Returns total INCLUDE count."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    lines.append("$ Generated by GFEM BDF Combination Tool")
-    lines.append(f"$ Date: {timestamp}")
-    lines.append("$")
-    lines.append("$ GFEM Model")
-    lines.append(f"INCLUDE '{gfem_path}'")
-    lines.append("$")
-    lines.append("$ Unit Case Loads")
+    solver_label = "NX Nastran" if solver == "NX" else "MSC Nastran"
+    lines: list[str] = []
 
+    # --- File header ---
+    lines += [
+        f"$ Generated by GFEM BDF Combination Tool",
+        f"$ Date: {timestamp}",
+        f"$ Solver: {solver_label}",
+        "$",
+    ]
+
+    # --- Executive Control ---
+    lines += [
+        "$ === EXECUTIVE CONTROL ===",
+        "SOL 101",
+        "CEND",
+        "$",
+    ]
+
+    # --- Case Control ---
+    lines += [
+        "$ === CASE CONTROL ===",
+        "TITLE = GFEM Combined Load Cases",
+        "$",
+    ]
+    for combo in combinations:
+        lines += [
+            f"SUBCASE {combo.case_id}",
+            f"  TITLE = Combined Case {combo.case_id}",
+            f"  LOAD = {combo.case_id}",
+            "$",
+        ]
+
+    # --- Bulk Data ---
+    lines += [
+        "BEGIN BULK",
+        "$",
+    ]
+
+    # Solver-specific PARAM
+    if solver == "NX":
+        lines.append("PARAM,POSTEXT,YES")
+    else:
+        lines.append("PARAM,POST,-1")
+    lines.append("$")
+
+    # GFEM model
+    lines += [
+        "$ GFEM Model",
+        f"INCLUDE '{gfem_path}'",
+        "$",
+    ]
+
+    # Unit case INCLUDEs
+    lines.append("$ Unit Case Loads")
     for p in include_paths:
         lines.append(f"INCLUDE '{p}'")
-
     lines.append("$")
-    lines.append("$ END")
+
+    # LOAD entries
+    lines.append("$ Combined LOAD Entries")
+    for combo in combinations:
+        lines.append(f"$ --- Case {combo.case_id} ---")
+        lines.extend(_format_load_entry(combo.case_id, combo.components))
+        lines.append("$")
+
+    lines.append("ENDDATA")
 
     with open(output_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
-    include_count = 1 + len(include_paths)  # 1 for GFEM
+    include_count = 1 + len(include_paths)
     if log_fn:
-        log_fn(f"[WRITE] {output_path}  ({include_count} INCLUDE lines total)")
+        log_fn(
+            f"[WRITE] {output_path}  "
+            f"({include_count} INCLUDEs, {len(combinations)} SUBCASEs, {len(combinations)} LOAD entries)"
+        )
     return include_count
 
 
@@ -176,40 +326,48 @@ class App(tk.Tk):
         frame.columnconfigure(1, weight=1)
 
         fields = [
-            ("GFEM BDF File:",        "gfem_var",    self._browse_gfem),
-            ("Combination Excel:",    "excel_var",   self._browse_excel),
+            ("GFEM BDF File:",        "gfem_var",     self._browse_gfem),
+            ("Combination Excel:",    "excel_var",    self._browse_excel),
             ("List Subcases Excel:",  "subcases_var", self._browse_subcases),
-            ("Unit Case Base Dir:",   "dir_var",     self._browse_dir),
-            ("Output BDF:",           "output_var",  self._browse_output),
+            ("Unit Case Base Dir:",   "dir_var",      self._browse_dir),
+            ("Output BDF:",           "output_var",   self._browse_output),
         ]
         for row, (label, attr, cmd) in enumerate(fields):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="e", **pad)
             var = tk.StringVar()
             setattr(self, attr, var)
-            entry = ttk.Entry(frame, textvariable=var, width=60)
-            entry.grid(row=row, column=1, sticky="ew", **pad)
+            ttk.Entry(frame, textvariable=var, width=60).grid(row=row, column=1, sticky="ew", **pad)
             ttk.Button(frame, text="Browse", command=cmd).grid(row=row, column=2, **pad)
 
+        # --- Solver selection ---
+        solver_frame = ttk.LabelFrame(frame, text="Nastran Solver", padding=6)
+        solver_frame.grid(row=len(fields), column=0, columnspan=3, sticky="w", padx=8, pady=6)
+        self.solver_var = tk.StringVar(value="NX")
+        ttk.Radiobutton(solver_frame, text="NX Nastran",  variable=self.solver_var, value="NX").pack(side="left", padx=12)
+        ttk.Radiobutton(solver_frame, text="MSC Nastran", variable=self.solver_var, value="MSC").pack(side="left", padx=12)
+
+        # --- Generate button ---
         self._gen_btn = ttk.Button(frame, text="Generate BDF", command=self._on_generate)
-        self._gen_btn.grid(row=len(fields), column=0, columnspan=3, pady=10)
+        self._gen_btn.grid(row=len(fields) + 1, column=0, columnspan=3, pady=8)
 
+        # --- Progress bar ---
         self._progress = ttk.Progressbar(frame, mode="indeterminate")
-        self._progress.grid(row=len(fields) + 1, column=0, columnspan=3, sticky="ew", padx=8)
+        self._progress.grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8)
 
+        # --- Status label ---
         self._status_var = tk.StringVar(value="Ready.")
         ttk.Label(
             frame, textvariable=self._status_var,
             foreground="#005580", font=("Courier", 8), anchor="w"
-        ).grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
+        ).grid(row=len(fields) + 3, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
 
-        ttk.Label(frame, text="Log:").grid(row=len(fields) + 3, column=0, sticky="w", padx=8)
+        # --- Log ---
+        ttk.Label(frame, text="Log:").grid(row=len(fields) + 4, column=0, sticky="w", padx=8)
         self._log_widget = scrolledtext.ScrolledText(
-            frame, height=18, state="disabled", wrap="word", font=("Courier", 8)
+            frame, height=16, state="disabled", wrap="word", font=("Courier", 8)
         )
-        self._log_widget.grid(
-            row=len(fields) + 4, column=0, columnspan=3, sticky="nsew", padx=8, pady=4
-        )
-        frame.rowconfigure(len(fields) + 4, weight=1)
+        self._log_widget.grid(row=len(fields) + 5, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
+        frame.rowconfigure(len(fields) + 5, weight=1)
 
     # --- Browse helpers ---
 
@@ -254,11 +412,12 @@ class App(tk.Tk):
     # --- Generate ---
 
     def _on_generate(self):
-        gfem      = self.gfem_var.get().strip()
-        excel     = self.excel_var.get().strip()
-        subcases  = self.subcases_var.get().strip()
-        base_dir  = self.dir_var.get().strip()
-        output    = self.output_var.get().strip()
+        gfem     = self.gfem_var.get().strip()
+        excel    = self.excel_var.get().strip()
+        subcases = self.subcases_var.get().strip()
+        base_dir = self.dir_var.get().strip()
+        output   = self.output_var.get().strip()
+        solver   = self.solver_var.get()
 
         errors = []
         if not gfem or not os.path.isfile(gfem):
@@ -280,15 +439,18 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._run_generation,
-            args=(gfem, excel, subcases, base_dir, output),
+            args=(gfem, excel, subcases, base_dir, output, solver),
             daemon=True,
         ).start()
 
-    def _run_generation(self, gfem, excel, subcases, base_dir, output):
+    def _run_generation(self, gfem, excel, subcases, base_dir, output, solver):
         try:
             self._status("Reading Combination Excel...")
             case_ids = read_case_ids_from_excel(excel, log_fn=self._log)
-            self._log(f"[INFO] {len(case_ids)} unique case IDs (thermal excluded).")
+            self._log(f"[INFO] {len(case_ids)} unique unit case IDs (thermal excluded).")
+
+            self._status("Reading load combinations...")
+            combinations = read_load_combinations(excel, log_fn=self._log)
 
             self._status("Reading List Subcases Excel...")
             subcase_mapping = read_subcase_mapping(subcases, log_fn=self._log)
@@ -299,17 +461,16 @@ class App(tk.Tk):
                 case_ids, subcase_mapping, base_dir, log_fn=self._log
             )
             self._log("-" * 60)
-
             self._log(
                 f"[INFO] {len(include_paths)} unique files to include. "
                 f"{len(missing)} IDs not found in subcases list."
             )
-
             if missing:
                 self._log(f"[ERROR] Missing IDs: {sorted(missing)}")
 
-            self._status("Writing output BDF...")
-            write_output_bdf(gfem, include_paths, output, log_fn=self._log)
+            solver_label = "NX Nastran" if solver == "NX" else "MSC Nastran"
+            self._status(f"Writing {solver_label} deck...")
+            write_output_bdf(gfem, include_paths, combinations, solver, output, log_fn=self._log)
             self._log("[DONE] Generation complete.")
             self._status("Done.")
 
