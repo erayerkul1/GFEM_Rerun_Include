@@ -230,6 +230,35 @@ def resolve_include_paths(
     return ordered_paths, missing_ids
 
 
+def _resolve_load_collector_ids(
+    combinations: list,
+    subcase_mapping: dict,
+) -> None:
+    """
+    Fix unit case IDs in LOAD entries to match actual load collector IDs in BDF files.
+
+    When the List Subcases filename contains a trailing number
+    (e.g. MASTER_MANOEUVRE_28999121.bdf → 28999121), the Combination Excel
+    stores a sequential ID (e.g. 10079) that does NOT match the load collector
+    in the BDF.  Replace it with the real number extracted from the filename.
+
+    When there is no trailing number (e.g. MASTER_CABIN.bdf), the original
+    unit case ID already matches the load collector ID in the BDF — keep it.
+    """
+    for combo in combinations:
+        new_components = []
+        for mult, unit_id in combo.components:
+            raw = subcase_mapping.get(unit_id, "")
+            filename = raw.replace("\\", "/").split("/")[-1]
+            term = _extract_search_term(filename)
+            if re.match(r'^\d+$', term):
+                load_id = int(term)
+            else:
+                load_id = unit_id
+            new_components.append((mult, load_id))
+        combo.components = new_components
+
+
 def _format_load_entry(case_id: int, components: list) -> list[str]:
     """
     Format a Nastran LOAD bulk entry with continuation lines.
@@ -506,6 +535,9 @@ class App(tk.Tk):
 
             self._status("Reading List Subcases Excel...")
             subcase_mapping = read_subcase_mapping(subcases, log_fn=self._log)
+
+            self._status("Resolving load collector IDs...")
+            _resolve_load_collector_ids(combinations, subcase_mapping)
 
             self._status("Resolving file paths...")
             self._log("-" * 60)
