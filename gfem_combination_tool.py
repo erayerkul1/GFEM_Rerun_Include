@@ -41,19 +41,66 @@ OUTPUT_REQUEST_OPTIONS: list[tuple[str, str, str, bool]] = [
     ("MPCFORCE(SORT1,PLOT)=ALL",            "MPCFORCE",     "MPC reaksiyon kuvvetleri",             False),
 ]
 
-# Each tuple: (keyword, name, value, description, default_checked)
-PARAM_OPTIONS: list[tuple[str, str, str, str, bool]] = [
-    ("PARAM",  "AUTOSPC",   "NO",   "Singüler DOF'ları otomatik sabitleme",          True),
-    ("PARAM",  "POST",      "-1",   "OP2 formatında post-processing çıktısı",        True),
-    ("PARAM",  "K6ROT",     "1.",   "Kabuk elemanları sondaj rijitliği çarpanı",     True),
-    ("PARAM",  "OUNIT2",    "12",   "İkincil çıktı birimi (inç→mm için 12)",         True),
-    ("PARAM",  "OMID",      "YES",  "Eleman çıktılarını orta noktadan al",           True),
-    ("PARAM",  "PRTMAXIM",  "YES",  "Maksimum değer özetini yazdır",                 True),
-    ("PARAM",  "BAILOUT",   "0",    "İlk kritik hatada analizi durdur (0=dur)",      True),
-    ("PARAM",  "OGEOM",     "YES",  "Geometri verisini çıktı dosyasına yaz",         True),
-    ("PARAM",  "PRGPST",    "YES",  "Grid noktası gerilmelerini yazdır",             True),
-    ("PARAM",  "POSTEXT",   "YES",  "Genişletilmiş çıktı – NX Nastran'a özgü",      False),
-    ("MDLPRM", "HDF5",      "1",    "HDF5 formatında ikincil çıktı dosyası oluştur", False),
+# Each tuple: (keyword, name, card_description, [(value, value_description), ...], default_value, default_checked)
+PARAM_OPTIONS: list[tuple] = [
+    ("PARAM", "AUTOSPC", "Singüler DOF'ları otomatik sabitleme", [
+        ("NO",  "Singüler DOF'ları olduğu gibi bırak — analiz uyarı verir, sonuç güvenilir"),
+        ("YES", "Otomatik SPC ekler — analizi tamamlar, sonuç doğruluğu değişebilir"),
+    ], "NO", True),
+
+    ("PARAM", "POST", "Post-processing çıktı formatı", [
+        ("-2", "OP2 + XDB — her iki formatta çıktı üret"),
+        ("-1", "OP2 — en yaygın MSC/NX post-processing formatı"),
+        ("0",  "Yok — post-processing çıktısı üretme"),
+        ("1",  "OP2 — NX Nastran uyumlu (−1 ile işlevsel olarak aynı)"),
+    ], "-1", True),
+
+    ("PARAM", "K6ROT", "Kabuk elemanları membran sondaj rijitliği", [
+        ("0.",   "Rijitlik yok — membran serbestçe döner (uyumsuzluk riski)"),
+        ("1.",   "Hafif rijitlik — önerilen değer"),
+        ("100.", "Yüksek rijitlik — aşırı kullanımda hatalı sonuç"),
+    ], "1.", True),
+
+    ("PARAM", "OUNIT2", "İkincil çıktı dosyası Fortran birimi", [
+        ("6",  "Birim 6 — standart çıktı (stdout)"),
+        ("11", "Birim 11"),
+        ("12", "Birim 12 — standart ikincil çıktı birimi"),
+    ], "12", True),
+
+    ("PARAM", "OMID", "Eleman gerilme/kuvvet çıktı konumu", [
+        ("YES", "Orta nokta — eleman merkezindeki değerleri çıkar"),
+        ("NO",  "Düğüm noktaları — extrapolation ile hesaplanır"),
+    ], "YES", True),
+
+    ("PARAM", "PRTMAXIM", "Maksimum değer özeti tablosu", [
+        ("YES", "Yazdır — analiz sonunda max değerleri özetler"),
+        ("NO",  "Yazdırma"),
+    ], "YES", True),
+
+    ("PARAM", "BAILOUT", "Kritik hata toleransı", [
+        ("0",  "İlk kritik hatada dur — güvenli mod"),
+        ("-1", "Tüm hataları görmezden gel — sadece debug için kullan"),
+    ], "0", True),
+
+    ("PARAM", "OGEOM", "Geometri verisini çıktı dosyasına yaz", [
+        ("YES", "Yaz — grid ve koordinat bilgilerini OP2'ye ekle"),
+        ("NO",  "Yazma — daha küçük çıktı dosyası"),
+    ], "YES", True),
+
+    ("PARAM", "PRGPST", "Grid noktası gerilmesi çıktısı", [
+        ("YES", "Yazdır — grid noktası gerilmelerini çıktıya ekle"),
+        ("NO",  "Yazdırma"),
+    ], "YES", True),
+
+    ("PARAM", "POSTEXT", "Genişletilmiş NX çıktısı", [
+        ("YES", "Aktif — NX'e özgü genişletilmiş çıktı formatını kullan"),
+        ("NO",  "Pasif"),
+    ], "YES", False),
+
+    ("MDLPRM", "HDF5", "HDF5 formatında ikincil çıktı", [
+        ("0", "Kapalı — HDF5 dosyası oluşturma"),
+        ("1", "Açık — .h5 uzantılı HDF5 çıktı dosyası oluştur"),
+    ], "1", False),
 ]
 
 
@@ -482,15 +529,39 @@ class App(tk.Tk):
         # --- PARAM Cards ---
         param_frame = ttk.LabelFrame(frame, text="PARAM Cards", padding=6)
         param_frame.grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        param_frame.columnconfigure(4, weight=1)
         self.param_vars: list[tk.BooleanVar] = []
-        for i, (kw, name, val, desc, default) in enumerate(PARAM_OPTIONS):
-            var = tk.BooleanVar(value=default)
-            self.param_vars.append(var)
-            row_f = ttk.Frame(param_frame)
-            row_f.grid(row=i // 2, column=(i % 2) * 2, sticky="w", padx=(0, 16))
-            label = f"{kw}  {name}  {val}"
-            ttk.Checkbutton(row_f, text=label, variable=var, width=22).pack(side="left")
-            ttk.Label(row_f, text=desc, foreground="#555", font=("", 7)).pack(side="left")
+        self.param_value_vars: list[tk.StringVar] = []
+        for i, (kw, name, _card_desc, value_opts, default_val, default_checked) in enumerate(PARAM_OPTIONS):
+            include_var = tk.BooleanVar(value=default_checked)
+            value_var = tk.StringVar(value=default_val)
+            self.param_vars.append(include_var)
+            self.param_value_vars.append(value_var)
+
+            ttk.Checkbutton(param_frame, variable=include_var).grid(
+                row=i, column=0, sticky="w", padx=(0, 2))
+            ttk.Label(param_frame, text=f"{kw}  {name}", width=16,
+                      anchor="e", font=("Courier", 8, "bold")).grid(row=i, column=1, sticky="e")
+            ttk.Label(param_frame, text="=").grid(row=i, column=2, padx=2)
+
+            combo = ttk.Combobox(
+                param_frame, textvariable=value_var,
+                values=[v for v, _ in value_opts],
+                state="readonly", width=7,
+            )
+            combo.grid(row=i, column=3, sticky="w", padx=(0, 8))
+
+            desc_lbl = ttk.Label(param_frame, text="", foreground="#555", font=("", 7))
+            desc_lbl.grid(row=i, column=4, sticky="w")
+
+            vdict = dict(value_opts)
+            def _make_updater(vv=value_var, vd=vdict, lbl=desc_lbl):
+                def _upd(*_):
+                    lbl.configure(text=vd.get(vv.get(), ""))
+                return _upd
+            upd = _make_updater()
+            value_var.trace_add("write", upd)
+            upd()
 
         # --- Generate button ---
         self._gen_btn = ttk.Button(frame, text="Generate BDF", command=self._on_generate)
@@ -586,9 +657,10 @@ class App(tk.Tk):
             if var.get()
         ]
         sel_params = [
-            f"{kw},{name},{val}"
-            for (kw, name, val, _, _), var in zip(PARAM_OPTIONS, self.param_vars)
-            if var.get()
+            f"{kw},{name},{value_var.get()}"
+            for (kw, name, *_rest), include_var, value_var
+            in zip(PARAM_OPTIONS, self.param_vars, self.param_value_vars)
+            if include_var.get()
         ]
 
         self._gen_btn.configure(state="disabled")
