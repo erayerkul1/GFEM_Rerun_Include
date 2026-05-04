@@ -394,12 +394,17 @@ def write_output_bdf(
     output_path: str,
     output_requests: list[str],
     param_cards: list[str],
+    spc_bdf_path: str = "",
+    spc_id: int = 0,
     log_fn=None,
 ) -> int:
     """Write a complete Nastran solution deck. Returns total INCLUDE count."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     solver_label = "NX Nastran" if solver == "NX" else "MSC Nastran"
     lines: list[str] = []
+
+    # SUBCASEs must be in ascending order (Nastran rule)
+    sorted_combos = sorted(combinations, key=lambda c: c.case_id)
 
     # --- File header ---
     lines += [
@@ -430,13 +435,13 @@ def write_output_bdf(
         lines.extend(output_requests)
         lines.append("$")
 
-    for combo in combinations:
-        lines += [
-            f"SUBCASE {combo.case_id}",
-            f"  TITLE = Combined Case {combo.case_id}",
-            f"  LOAD = {combo.case_id}",
-            "$",
-        ]
+    for combo in sorted_combos:
+        lines.append(f"SUBCASE {combo.case_id}")
+        lines.append(f"  TITLE = Combined Case {combo.case_id}")
+        if spc_id:
+            lines.append(f"  SPC = {spc_id}")
+        lines.append(f"  LOAD = {combo.case_id}")
+        lines.append("$")
 
     # --- Bulk Data ---
     lines += [
@@ -457,15 +462,23 @@ def write_output_bdf(
         "$",
     ]
 
+    # SPC BDF (optional)
+    if spc_bdf_path:
+        lines += [
+            "$ SPC Constraints",
+            f"INCLUDE '{spc_bdf_path}'",
+            "$",
+        ]
+
     # Unit case INCLUDEs
     lines.append("$ Unit Case Loads")
     for p in include_paths:
         lines.append(f"INCLUDE '{p}'")
     lines.append("$")
 
-    # LOAD entries
+    # LOAD entries (same sorted order)
     lines.append("$ Combined LOAD Entries")
-    for combo in combinations:
+    for combo in sorted_combos:
         lines.append(f"$ --- Case {combo.case_id} ---")
         lines.extend(_format_load_entry(combo.case_id, combo.components))
         lines.append("$")
@@ -475,11 +488,11 @@ def write_output_bdf(
     with open(output_path, "w") as f:
         f.write("\n".join(lines) + "\n")
 
-    include_count = 1 + len(include_paths)
+    include_count = 1 + len(include_paths) + (1 if spc_bdf_path else 0)
     if log_fn:
         log_fn(
             f"[WRITE] {output_path}  "
-            f"({include_count} INCLUDEs, {len(combinations)} SUBCASEs, {len(combinations)} LOAD entries)"
+            f"({include_count} INCLUDEs, {len(sorted_combos)} SUBCASEs, {len(sorted_combos)} LOAD entries)"
         )
     return include_count
 
@@ -520,16 +533,36 @@ class App(tk.Tk):
             ttk.Entry(frame, textvariable=var, width=60).grid(row=row, column=1, sticky="ew", **pad)
             ttk.Button(frame, text="Browse", command=cmd).grid(row=row, column=2, **pad)
 
+        # --- SPC ---
+        spc_row = len(fields)
+        ttk.Label(frame, text="SPC BDF File:").grid(row=spc_row, column=0, sticky="e", **pad)
+        self.spc_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.spc_var, width=60).grid(
+            row=spc_row, column=1, sticky="ew", **pad)
+        ttk.Button(frame, text="Browse", command=self._browse_spc).grid(
+            row=spc_row, column=2, **pad)
+
+        ttk.Label(frame, text="SPC ID:").grid(row=spc_row + 1, column=0, sticky="e", **pad)
+        self.spc_id_var = tk.StringVar()
+        ttk.Entry(frame, textvariable=self.spc_id_var, width=12).grid(
+            row=spc_row + 1, column=1, sticky="w", **pad)
+        ttk.Label(frame, text="(boş bırakılırsa SUBCASE'e SPC eklenmez)",
+                  foreground="#888", font=("", 7)).grid(
+            row=spc_row + 1, column=1, sticky="w", padx=(100, 0))
+
+        _SPC_ROWS = 2
+
         # --- Solver selection ---
+        _R = len(fields) + _SPC_ROWS
         solver_frame = ttk.LabelFrame(frame, text="Nastran Solver", padding=6)
-        solver_frame.grid(row=len(fields), column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        solver_frame.grid(row=_R, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
         self.solver_var = tk.StringVar(value="NX")
         ttk.Radiobutton(solver_frame, text="NX Nastran",  variable=self.solver_var, value="NX").pack(side="left", padx=12)
         ttk.Radiobutton(solver_frame, text="MSC Nastran", variable=self.solver_var, value="MSC").pack(side="left", padx=12)
 
         # --- Global Output Requests ---
         out_frame = ttk.LabelFrame(frame, text="Global Output Requests", padding=6)
-        out_frame.grid(row=len(fields) + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        out_frame.grid(row=_R + 1, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
         self.output_req_vars: list[tk.BooleanVar] = []
         for i, (card, name, desc, default) in enumerate(OUTPUT_REQUEST_OPTIONS):
             var = tk.BooleanVar(value=default)
@@ -541,7 +574,7 @@ class App(tk.Tk):
 
         # --- PARAM Cards ---
         param_frame = ttk.LabelFrame(frame, text="PARAM Cards", padding=6)
-        param_frame.grid(row=len(fields) + 2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
+        param_frame.grid(row=_R + 2, column=0, columnspan=3, sticky="ew", padx=8, pady=4)
         param_frame.columnconfigure(4, weight=1)
         self.param_vars: list[tk.BooleanVar] = []
         self.param_value_vars: list[tk.StringVar] = []
@@ -578,26 +611,26 @@ class App(tk.Tk):
 
         # --- Generate button ---
         self._gen_btn = ttk.Button(frame, text="Generate BDF", command=self._on_generate)
-        self._gen_btn.grid(row=len(fields) + 3, column=0, columnspan=3, pady=8)
+        self._gen_btn.grid(row=_R + 3, column=0, columnspan=3, pady=8)
 
         # --- Progress bar ---
         self._progress = ttk.Progressbar(frame, mode="indeterminate")
-        self._progress.grid(row=len(fields) + 4, column=0, columnspan=3, sticky="ew", padx=8)
+        self._progress.grid(row=_R + 4, column=0, columnspan=3, sticky="ew", padx=8)
 
         # --- Status label ---
         self._status_var = tk.StringVar(value="Ready.")
         ttk.Label(
             frame, textvariable=self._status_var,
             foreground="#005580", font=("Courier", 8), anchor="w"
-        ).grid(row=len(fields) + 5, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
+        ).grid(row=_R + 5, column=0, columnspan=3, sticky="ew", padx=8, pady=(2, 0))
 
         # --- Log ---
-        ttk.Label(frame, text="Log:").grid(row=len(fields) + 6, column=0, sticky="w", padx=8)
+        ttk.Label(frame, text="Log:").grid(row=_R + 6, column=0, sticky="w", padx=8)
         self._log_widget = scrolledtext.ScrolledText(
             frame, height=12, state="disabled", wrap="word", font=("Courier", 8)
         )
-        self._log_widget.grid(row=len(fields) + 7, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
-        frame.rowconfigure(len(fields) + 7, weight=1)
+        self._log_widget.grid(row=_R + 7, column=0, columnspan=3, sticky="nsew", padx=8, pady=4)
+        frame.rowconfigure(_R + 7, weight=1)
 
     # --- Browse helpers ---
 
@@ -639,6 +672,14 @@ class App(tk.Tk):
         if p:
             self.output_var.set(p)
 
+    def _browse_spc(self):
+        p = filedialog.askopenfilename(
+            title="Select SPC BDF File",
+            filetypes=[("BDF files", "*.bdf *.BDF"), ("All files", "*.*")],
+        )
+        if p:
+            self.spc_var.set(p)
+
     # --- Generate ---
 
     def _on_generate(self):
@@ -648,6 +689,8 @@ class App(tk.Tk):
         base_dir = self.dir_var.get().strip()
         output   = self.output_var.get().strip()
         solver   = self.solver_var.get()
+        spc_bdf  = self.spc_var.get().strip()
+        spc_id_s = self.spc_id_var.get().strip()
 
         errors = []
         if not gfem or not os.path.isfile(gfem):
@@ -660,6 +703,14 @@ class App(tk.Tk):
             errors.append("Unit case base directory not found.")
         if not output:
             errors.append("Please specify an output BDF path.")
+        if spc_bdf and not os.path.isfile(spc_bdf):
+            errors.append("SPC BDF file not found.")
+        spc_id = 0
+        if spc_id_s:
+            try:
+                spc_id = int(spc_id_s)
+            except ValueError:
+                errors.append("SPC ID must be an integer.")
         if errors:
             messagebox.showerror("Input Error", "\n".join(errors))
             return
@@ -681,12 +732,13 @@ class App(tk.Tk):
 
         threading.Thread(
             target=self._run_generation,
-            args=(gfem, excel, subcases, base_dir, output, solver, sel_outputs, sel_params),
+            args=(gfem, excel, subcases, base_dir, output, solver,
+                  sel_outputs, sel_params, spc_bdf, spc_id),
             daemon=True,
         ).start()
 
     def _run_generation(self, gfem, excel, subcases, base_dir, output, solver,
-                        sel_outputs, sel_params):
+                        sel_outputs, sel_params, spc_bdf, spc_id):
         try:
             self._status("Reading Combination Excel...")
             case_ids = read_case_ids_from_excel(excel, log_fn=self._log)
@@ -720,6 +772,8 @@ class App(tk.Tk):
                 gfem, include_paths, combinations, solver, output,
                 output_requests=sel_outputs,
                 param_cards=sel_params,
+                spc_bdf_path=spc_bdf,
+                spc_id=spc_id,
                 log_fn=self._log,
             )
             self._log("[DONE] Generation complete.")
