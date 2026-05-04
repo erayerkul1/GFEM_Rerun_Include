@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -142,18 +143,36 @@ def read_subcase_mapping(list_excel_path: str, log_fn=None) -> dict[int, str]:
     return mapping
 
 
-def _build_file_index(base_dir: str, log_fn=None) -> dict[str, str]:
-    """Walk base_dir recursively and return {lowercase_filename: full_path} for all .bdf files."""
-    index: dict[str, str] = {}
-    count = 0
+def _build_bdf_file_list(base_dir: str, log_fn=None) -> list[str]:
+    """Walk base_dir recursively and return full paths of all .bdf files."""
+    paths: list[str] = []
     for root, _, files in os.walk(base_dir):
         for fname in files:
             if fname.lower().endswith(".bdf"):
-                index[fname.lower()] = os.path.join(root, fname)
-                count += 1
+                paths.append(os.path.join(root, fname))
     if log_fn:
-        log_fn(f"[INDEX] {count} BDF files indexed under {base_dir}")
-    return index
+        log_fn(f"[INDEX] {len(paths)} BDF files indexed under {base_dir}")
+    return paths
+
+
+def _extract_search_term(filename: str) -> str:
+    """
+    Determine what to search for inside base_dir given a List Subcases filename.
+
+    Rules:
+      MASTER_MANOEUVRE_28999121.bdf  →  '28999121'   (trailing number after last _)
+      MASTER_CABIN.bdf               →  'CABIN'      (word after MASTER_ when no trailing number)
+    """
+    stem = os.path.splitext(filename)[0]
+    # Trailing number: MASTER_TYPE_123456  →  '123456'
+    m = re.search(r'_(\d+)$', stem)
+    if m:
+        return m.group(1)
+    # No trailing number: extract token after MASTER_ (or MASTER)
+    m2 = re.match(r'(?i)MASTER_?([A-Z]+)', stem)
+    if m2:
+        return m2.group(1).upper()
+    return stem
 
 
 def resolve_include_paths(
@@ -163,11 +182,14 @@ def resolve_include_paths(
     log_fn=None,
 ) -> tuple[list[str], list[int]]:
     """
-    Resolve unit case IDs to absolute file paths by searching base_dir recursively.
-    Only the filename from the List Subcases path is used for matching.
+    For each unit case ID:
+      - extract a search term from its List Subcases filename
+        (trailing number if present, otherwise the keyword after MASTER_)
+      - find ALL .bdf files in base_dir whose name contains that term
+      - add them to the INCLUDE list (deduplicated)
     Returns (ordered_unique_paths, missing_ids).
     """
-    file_index = _build_file_index(base_dir, log_fn=log_fn)
+    all_bdf = _build_bdf_file_list(base_dir, log_fn=log_fn)
 
     seen: set[str] = set()
     ordered_paths: list[str] = []
@@ -180,25 +202,30 @@ def resolve_include_paths(
                 log_fn(f"[ERROR] Case ID {cid} not found in List Subcases Excel.")
             continue
 
-        # Handle both Windows (\) and Unix (/) path separators
-        filename = subcase_mapping[cid].replace("\\", "/").split("/")[-1]
-        full_path = file_index.get(filename.lower())
+        raw = subcase_mapping[cid].replace("\\", "/").split("/")[-1]
+        term = _extract_search_term(raw)
+        term_lower = term.lower()
 
-        if full_path is None:
+        matches = [p for p in all_bdf if term_lower in os.path.basename(p).lower()]
+
+        if not matches:
             missing_ids.append(cid)
             if log_fn:
-                log_fn(f"[ERROR] {cid} → '{filename}' not found under {base_dir}")
+                log_fn(f"[ERROR] {cid} ('{raw}') → no files found for search term '{term}'")
             continue
 
-        full_path = os.path.normpath(full_path)
-        if full_path not in seen:
-            seen.add(full_path)
-            ordered_paths.append(full_path)
-            if log_fn:
-                log_fn(f"[OK]    {cid} → {full_path}")
-        else:
-            if log_fn:
-                log_fn(f"[DUP]   {cid} → already included ({filename}), skipped.")
+        new_count = 0
+        for p in matches:
+            norm = os.path.normpath(p)
+            if norm not in seen:
+                seen.add(norm)
+                ordered_paths.append(norm)
+                new_count += 1
+
+        if log_fn:
+            dup = len(matches) - new_count
+            dup_str = f", {dup} already seen" if dup else ""
+            log_fn(f"[OK]    {cid} (search='{term}') → {new_count} files added{dup_str}")
 
     return ordered_paths, missing_ids
 
