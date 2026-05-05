@@ -410,6 +410,26 @@ def _read_spc_id_from_bdf(path: str) -> int | None:
     return None
 
 
+_NASTRAN_MAX_ID = 9_999_999   # Nastran SUBCASE/LOAD SID max 7 digits
+
+
+def _best_include_path(full_path: str, output_dir: str, max_chars: int = 64) -> tuple[str, bool]:
+    """
+    Return (path_to_use, exceeded).
+    Tries relative path from output_dir first; uses whichever is shorter.
+    exceeded=True if the chosen path still exceeds max_chars.
+    """
+    try:
+        rel = os.path.relpath(full_path, output_dir).replace("\\", "/")
+    except ValueError:
+        rel = None  # Different drive on Windows
+
+    abs_fwd = full_path.replace("\\", "/")
+    candidates = [c for c in [rel, abs_fwd] if c is not None]
+    best = min(candidates, key=len)
+    return best, len(best) > max_chars
+
+
 def write_output_bdf(
     gfem_path: str,
     include_paths: list[str],
@@ -429,6 +449,34 @@ def write_output_bdf(
 
     # SUBCASEs must be in ascending order (Nastran rule)
     sorted_combos = sorted(combinations, key=lambda c: c.case_id)
+
+    # --- Build 7-digit SUBCASE/LOAD SID map ---
+    id_map: dict[int, int] = {}
+    reverse_map: dict[int, int] = {}  # remapped → original (for collision detection)
+    for combo in sorted_combos:
+        orig = combo.case_id
+        remapped = orig if orig <= _NASTRAN_MAX_ID else orig % 10_000_000
+        if remapped in reverse_map and reverse_map[remapped] != orig:
+            if log_fn:
+                log_fn(
+                    f"[WARN] ID collision: {reverse_map[remapped]} and {orig} "
+                    f"both remap to {remapped} — manual fix required"
+                )
+        id_map[orig] = remapped
+        reverse_map[remapped] = orig
+
+    # --- INCLUDE path helper setup ---
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+
+    def _write_include(path: str) -> list[str]:
+        best, exceeded = _best_include_path(path, output_dir)
+        result = []
+        if exceeded:
+            if log_fn:
+                log_fn(f"[WARN] INCLUDE path {len(best)} chars > 64 — NX Nastran may fail: {best}")
+            result.append(f"$ WARN: path > 64 chars")
+        result.append(f"INCLUDE '{best}'")
+        return result
 
     # --- File header ---
     lines += [
@@ -460,11 +508,14 @@ def write_output_bdf(
         lines.append("$")
 
     for combo in sorted_combos:
-        lines.append(f"SUBCASE {combo.case_id}")
-        lines.append(f"  TITLE = Combined Case {combo.case_id}")
+        orig = combo.case_id
+        sid = id_map[orig]
+        title_comment = f"  $ Original: {orig}" if sid != orig else ""
+        lines.append(f"SUBCASE {sid}")
+        lines.append(f"  TITLE = Combined Case {sid}{title_comment}")
         if spc_id:
             lines.append(f"  SPC = {spc_id}")
-        lines.append(f"  LOAD = {combo.case_id}")
+        lines.append(f"  LOAD = {sid}")
         lines.append("$")
 
     # --- Bulk Data ---
@@ -480,31 +531,30 @@ def write_output_bdf(
         lines.append("$")
 
     # GFEM model
-    lines += [
-        "$ GFEM Model",
-        f"INCLUDE '{gfem_path}'",
-        "$",
-    ]
+    lines.append("$ GFEM Model")
+    lines.extend(_write_include(gfem_path))
+    lines.append("$")
 
     # SPC BDF (optional)
     if spc_bdf_path:
-        lines += [
-            "$ SPC Constraints",
-            f"INCLUDE '{spc_bdf_path}'",
-            "$",
-        ]
+        lines.append("$ SPC Constraints")
+        lines.extend(_write_include(spc_bdf_path))
+        lines.append("$")
 
     # Unit case INCLUDEs
     lines.append("$ Unit Case Loads")
     for p in include_paths:
-        lines.append(f"INCLUDE '{p}'")
+        lines.extend(_write_include(p))
     lines.append("$")
 
     # LOAD entries (same sorted order)
     lines.append("$ Combined LOAD Entries")
     for combo in sorted_combos:
-        lines.append(f"$ --- Case {combo.case_id} ---")
-        lines.extend(_format_load_entry(combo.case_id, combo.components))
+        orig = combo.case_id
+        sid = id_map[orig]
+        orig_comment = f" (orig: {orig})" if sid != orig else ""
+        lines.append(f"$ --- Case {sid}{orig_comment} ---")
+        lines.extend(_format_load_entry(sid, combo.components))
         lines.append("$")
 
     lines.append("ENDDATA")
