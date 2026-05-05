@@ -413,21 +413,38 @@ def _read_spc_id_from_bdf(path: str) -> int | None:
 _NASTRAN_MAX_ID = 9_999_999   # Nastran SUBCASE/LOAD SID max 7 digits
 
 
-def _best_include_path(full_path: str, output_dir: str, max_chars: int = 64) -> tuple[str, bool]:
+def _format_include_lines(path: str, max_len: int = 64) -> list[str]:
     """
-    Return (path_to_use, exceeded).
-    Tries relative path from output_dir first; uses whichever is shorter.
-    exceeded=True if the chosen path still exceeds max_chars.
+    Format an INCLUDE statement splitting at '/' boundaries so that
+    every output line is at most max_len characters.
+    Trailing slash is placed at the END of each intermediate line so
+    continuation lines always start with a directory/file name.
+    A single segment that is itself longer than max_len is written as-is
+    on its own line (cannot split within a name).
     """
-    try:
-        rel = os.path.relpath(full_path, output_dir).replace("\\", "/")
-    except ValueError:
-        rel = None  # Different drive on Windows
+    path = path.replace("\\", "/")
+    if len(f"INCLUDE '{path}'") <= max_len:
+        return [f"INCLUDE '{path}'"]
 
-    abs_fwd = full_path.replace("\\", "/")
-    candidates = [c for c in [rel, abs_fwd] if c is not None]
-    best = min(candidates, key=len)
-    return best, len(best) > max_chars
+    parts = path.split("/")
+    # Each non-last part keeps its trailing slash
+    segments = [p + "/" for p in parts[:-1]] + [parts[-1]]
+
+    result: list[str] = []
+    current = "INCLUDE '"
+
+    for seg in segments:
+        if current == "INCLUDE '":
+            # First segment — always place it regardless of length
+            current += seg
+        elif len(current + seg) <= max_len:
+            current += seg
+        else:
+            result.append(current)
+            current = seg
+
+    result.append(current + "'")
+    return result
 
 
 def write_output_bdf(
@@ -464,19 +481,6 @@ def write_output_bdf(
                 )
         id_map[orig] = remapped
         reverse_map[remapped] = orig
-
-    # --- INCLUDE path helper setup ---
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-
-    def _write_include(path: str) -> list[str]:
-        best, exceeded = _best_include_path(path, output_dir)
-        result = []
-        if exceeded:
-            if log_fn:
-                log_fn(f"[WARN] INCLUDE path {len(best)} chars > 64 — NX Nastran may fail: {best}")
-            result.append(f"$ WARN: path > 64 chars")
-        result.append(f"INCLUDE '{best}'")
-        return result
 
     # --- File header ---
     lines += [
@@ -532,19 +536,19 @@ def write_output_bdf(
 
     # GFEM model
     lines.append("$ GFEM Model")
-    lines.extend(_write_include(gfem_path))
+    lines.extend(_format_include_lines(gfem_path))
     lines.append("$")
 
     # SPC BDF (optional)
     if spc_bdf_path:
         lines.append("$ SPC Constraints")
-        lines.extend(_write_include(spc_bdf_path))
+        lines.extend(_format_include_lines(spc_bdf_path))
         lines.append("$")
 
     # Unit case INCLUDEs
     lines.append("$ Unit Case Loads")
     for p in include_paths:
-        lines.extend(_write_include(p))
+        lines.extend(_format_include_lines(p))
     lines.append("$")
 
     # LOAD entries (same sorted order)
