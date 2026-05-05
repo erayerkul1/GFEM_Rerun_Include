@@ -131,11 +131,18 @@ class LoadCombination:
 # Core logic
 # ---------------------------------------------------------------------------
 
+def _read_df(path: str) -> "pd.DataFrame":
+    """Read an Excel or CSV file into a DataFrame."""
+    if path.lower().endswith(".csv"):
+        return pd.read_csv(path)
+    return pd.read_excel(path, engine="openpyxl")
+
+
 def read_case_ids_from_excel(excel_path: str, log_fn=None) -> set[int]:
     """Return unique non-zero integer case IDs from all *CASE ID columns excluding THERMAL."""
     if log_fn:
         log_fn("[EXCEL] Reading Combination Excel...")
-    df = pd.read_excel(excel_path, engine="openpyxl")
+    df = _read_df(excel_path)
 
     cols = list(df.columns)
     case_id_cols = [
@@ -164,7 +171,7 @@ def read_load_combinations(excel_path: str, log_fn=None) -> list[LoadCombination
     Each *CASE ID column (non-thermal) and its immediately following Multiplier column
     form one component pair.
     """
-    df = pd.read_excel(excel_path, engine="openpyxl")
+    df = _read_df(excel_path)
     cols = list(df.columns)
 
     combined_id_col = cols[0]
@@ -213,7 +220,7 @@ def read_subcase_mapping(list_excel_path: str, log_fn=None) -> dict[int, str]:
     """
     if log_fn:
         log_fn("[SUBCASES] Reading List Subcases Excel...")
-    df = pd.read_excel(list_excel_path, engine="openpyxl")
+    df = _read_df(list_excel_path)
 
     cols = list(df.columns)
     file_col = cols[0]
@@ -766,16 +773,16 @@ class App(tk.Tk):
 
     def _browse_excel(self):
         p = filedialog.askopenfilename(
-            title="Select Combination Excel",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")],
+            title="Select Combination Excel / CSV",
+            filetypes=[("Excel/CSV files", "*.xlsx *.xls *.csv"), ("All files", "*.*")],
         )
         if p:
             self.excel_var.set(p)
 
     def _browse_subcases(self):
         p = filedialog.askopenfilename(
-            title="Select List Subcases Excel",
-            filetypes=[("Excel files", "*.xlsx *.xls"), ("All files", "*.*")],
+            title="Select List Subcases Excel / CSV",
+            filetypes=[("Excel/CSV files", "*.xlsx *.xls *.csv"), ("All files", "*.*")],
         )
         if p:
             self.subcases_var.set(p)
